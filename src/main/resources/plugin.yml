@@ -1,0 +1,19 @@
+name: PlayerMoveLog
+version: 1.0.0
+main: com.proma.movelog.PlayerMoveLog
+api-version: "1.21"
+description: 轻量级玩家移动轨迹定时记录工具 — 每1分钟记录在线玩家坐标到 movelog 目录
+author: Proma
+website: https://github.com/proma/player-move-log
+
+commands:
+  movelog:
+    description: 控制玩家移动轨迹记录插件
+    usage: /movelog <on|off|reload|status>
+    permission: movelog.admin
+    aliases: [mlog]
+
+permissions:
+  movelog.admin:
+    description: 允许使用 /movelog 命令管理记录功能
+    default: op

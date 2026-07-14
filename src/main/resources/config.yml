@@ -1,0 +1,38 @@
+# PlayerMoveLog 配置文件
+# 修改后使用 /movelog reload 重新加载
+
+# 是否启用记录（默认开启）
+enabled: true
+
+# 记录间隔（单位：游戏刻，1200 = 60秒 = 1分钟）
+record-interval-ticks: 1200
+
+# TPS 阈值 — 当服务器 1 分钟平均 TPS 低于此值时自动跳过本次记录
+# 设为 0 可禁用 TPS 检测
+tps-threshold: 18.0
+
+# 日志写入缓冲区大小（字节）
+buffer-size: 8192
+
+# 大型服务器分批写入 — 玩家数超过此阈值时启用分批写入
+batch-threshold: 100
+
+# 每批写入的玩家记录数
+batch-size: 50
+
+# 时区（日志时间戳时区，默认 Asia/Shanghai = 北京时间 UTC+8）
+timezone: Asia/Shanghai
+
+# 日志文件切分间隔（小时），默认 4。取值必须能被 24 整除（1, 2, 3, 4, 6, 8, 12, 24）
+# 设为 4 表示每 4 小时一个文件：2026-07-14-00.log, 2026-07-14-04.log, ...
+# 设为 24 则恢复按天分文件（与旧版行为一致）
+rotation-hours: 4
+
+# 日期格式（用于日志文件名中的日期部分）
+date-format: yyyy-MM-dd
+
+# 时间格式（用于日志行内时间戳，精确到秒）
+time-format: yyyy-MM-dd HH:mm:ss
+
+# 输出目录名（位于服务器根目录下，与 world 同级）
+output-dir: movelog
