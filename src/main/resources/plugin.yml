@@ -4,7 +4,7 @@ main: com.proma.movelog.PlayerMoveLog
 api-version: "1.21"
 description: 轻量级玩家移动轨迹定时记录工具 — 每1分钟记录在线玩家坐标到 movelog 目录
 author: Proma
-website: https://github.com/proma/player-move-log
+website: https://github.com/KUBOAKI01/movelog
 
 commands:
   movelog:
