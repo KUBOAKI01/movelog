@@ -60,6 +60,7 @@ public final class PlayerMoveLog extends JavaPlugin implements CommandExecutor, 
         // 确定 movelog 输出目录
         File serverRoot = getServer().getWorldContainer();
         String outputDirName = getConfig().getString("output-dir", "movelog");
+        if (outputDirName == null || outputDirName.isEmpty()) outputDirName = "movelog";
 
         // 路径穿越防护
         if (outputDirName.contains("..") || outputDirName.contains("/") || outputDirName.contains("\\")) {
@@ -120,10 +121,11 @@ public final class PlayerMoveLog extends JavaPlugin implements CommandExecutor, 
             cmd.setTabCompleter(this);
         }
 
-        // 注册事件监听器
-        searchLines = getConfig().getInt("search-lines", 20);
+        // 注册事件监听器（需要监听事件或聊天时都必须注册）
+        searchLines = Math.max(1, getConfig().getInt("search-lines", 20));
         boolean eventLogEnabled = getConfig().getBoolean("event-logging.enabled", true);
-        if (eventLogEnabled) {
+        boolean chatLogEnabled = getConfig().getBoolean("chat-logging.enabled", false);
+        if (eventLogEnabled || chatLogEnabled) {
             getServer().getPluginManager().registerEvents(
                     new MoveEventListener(moveRecorder, timezone,
                             getConfig().getString("time-format", "yyyy-MM-dd HH:mm:ss"),
@@ -169,8 +171,8 @@ public final class PlayerMoveLog extends JavaPlugin implements CommandExecutor, 
      */
     private MoveRecorder buildRecorderFromConfig() {
         recordIntervalTicks = getConfig().getLong("record-interval-ticks", 1200L);
-        if (recordIntervalTicks < 1) {
-            getLogger().warning("record-interval-ticks 必须 >= 1，已重置为默认值 1200（60 秒）");
+        if (recordIntervalTicks < 100) {
+            getLogger().warning("record-interval-ticks 必须 >= 100（5 秒），已重置为默认值 1200（60 秒）");
             recordIntervalTicks = 1200L;
         }
         int rotationHours = getConfig().getInt("rotation-hours", 4);
@@ -199,14 +201,20 @@ public final class PlayerMoveLog extends JavaPlugin implements CommandExecutor, 
         int chatRotationHours = rotationHours;
         if (chatLogEnabled) {
             String chatDirName = getConfig().getString("chat-logging.output-dir", "chatlog");
-            chatLogDir = new File(getServer().getWorldContainer(), chatDirName);
-            if (!chatLogDir.exists() && !chatLogDir.mkdirs()) {
-                getLogger().warning("无法创建 chatlog 目录: " + chatLogDir.getAbsolutePath() + "，聊天记录已禁用。");
-                chatLogDir = null;
-            }
-            chatRotationHours = getConfig().getInt("chat-logging.rotation-hours", rotationHours);
-            if (chatRotationHours < 1 || chatRotationHours > 24 || 24 % chatRotationHours != 0) {
-                chatRotationHours = rotationHours;
+            if (chatDirName == null || chatDirName.contains("..") || chatDirName.contains("/") || chatDirName.contains("\\")) {
+                getLogger().warning("chat-logging.output-dir 包含非法路径字符，聊天记录已禁用。");
+            } else {
+                chatLogDir = new File(getServer().getWorldContainer(), chatDirName);
+                if (!chatLogDir.exists() && !chatLogDir.mkdirs()) {
+                    getLogger().warning("无法创建 chatlog 目录: " + chatLogDir.getAbsolutePath() + "，聊天记录已禁用。");
+                    chatLogDir = null;
+                }
+                if (chatLogDir != null) {
+                    chatRotationHours = getConfig().getInt("chat-logging.rotation-hours", rotationHours);
+                    if (chatRotationHours < 1 || chatRotationHours > 24 || 24 % chatRotationHours != 0) {
+                        chatRotationHours = rotationHours;
+                    }
+                }
             }
         }
 
@@ -235,6 +243,8 @@ public final class PlayerMoveLog extends JavaPlugin implements CommandExecutor, 
                     moveRecorder.setEnabled(true);
                     sender.sendMessage("§a[PlayerMoveLog] 记录已开启。");
                     getLogger().info("记录已由 " + sender.getName() + " 手动开启。");
+                } else {
+                    sender.sendMessage("§c[PlayerMoveLog] 插件未初始化。");
                 }
                 break;
 
@@ -243,6 +253,8 @@ public final class PlayerMoveLog extends JavaPlugin implements CommandExecutor, 
                     moveRecorder.setEnabled(false);
                     sender.sendMessage("§e[PlayerMoveLog] 记录已暂停。");
                     getLogger().info("记录已由 " + sender.getName() + " 手动暂停。");
+                } else {
+                    sender.sendMessage("§c[PlayerMoveLog] 插件未初始化。");
                 }
                 break;
 
@@ -437,9 +449,9 @@ public final class PlayerMoveLog extends JavaPlugin implements CommandExecutor, 
         if (moveRecorder == null) return false;
 
         // ── 第一步：验证新输出目录 ──
-        moveLogDir = moveLogDir; // keep existing if not changed
         File serverRoot = getServer().getWorldContainer();
         String outputDirName = getConfig().getString("output-dir", "movelog");
+        if (outputDirName == null || outputDirName.isEmpty()) outputDirName = "movelog";
 
         // 路径穿越防护
         if (outputDirName.contains("..") || outputDirName.contains("/") || outputDirName.contains("\\")) {
@@ -498,10 +510,11 @@ public final class PlayerMoveLog extends JavaPlugin implements CommandExecutor, 
         recorderTaskId = newTask.getTaskId();
         searchLines = getConfig().getInt("search-lines", 20);
 
-        // 重新注册事件监听器（如果启用了事件记录）
+        // 重新注册事件监听器（先注销旧的再注册新的）
+        org.bukkit.event.HandlerList.unregisterAll((org.bukkit.plugin.Plugin) this);
         boolean eventLogEnabled = getConfig().getBoolean("event-logging.enabled", true);
-        if (eventLogEnabled) {
-            // 注销旧的监听器（通过重新注册实现——Bukkit 会自动去重）
+        boolean chatLogEnabled = getConfig().getBoolean("chat-logging.enabled", false);
+        if (eventLogEnabled || chatLogEnabled) {
             getServer().getPluginManager().registerEvents(
                     new MoveEventListener(moveRecorder, timezone,
                             getConfig().getString("time-format", "yyyy-MM-dd HH:mm:ss"),
