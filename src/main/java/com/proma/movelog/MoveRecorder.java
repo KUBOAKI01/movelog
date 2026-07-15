@@ -83,6 +83,7 @@ public class MoveRecorder extends BukkitRunnable {
     private final Set<String> includedPlayers;
     private final int maxConsecutiveFailures;
     private final boolean eventLogEnabled;
+    private final boolean logInventory;
 
     /** 坐标格式化器（DecimalFormat 非线程安全，由 AtomicBoolean running 保证单线程调用） */
     private final DecimalFormat coordFormat =
@@ -132,7 +133,7 @@ public class MoveRecorder extends BukkitRunnable {
                         String emptyItemText, String exemptPermission,
                         List<String> worldWhitelistRaw, List<String> worldBlacklistRaw,
                         List<String> excludedPlayersRaw, List<String> includedPlayersRaw,
-                        int maxConsecutiveFailures, boolean eventLogEnabled) {
+                        int maxConsecutiveFailures, boolean eventLogEnabled, boolean logInventory) {
         // ── 参数校验 ──
         if (bufferSize < 1) {
             throw new IllegalArgumentException("buffer-size 必须 >= 1，当前值: " + bufferSize);
@@ -173,6 +174,7 @@ public class MoveRecorder extends BukkitRunnable {
         this.includedPlayers = (includedPlayersRaw != null) ? new HashSet<>(includedPlayersRaw) : Collections.emptySet();
         this.maxConsecutiveFailures = Math.max(1, maxConsecutiveFailures);
         this.eventLogEnabled = eventLogEnabled;
+        this.logInventory = logInventory;
 
         this.zoneId = ZoneId.of(timezone);
         this.dateFormatter = DateTimeFormatter.ofPattern(dateFormat).withZone(zoneId);
@@ -354,14 +356,63 @@ public class MoveRecorder extends BukkitRunnable {
             itemStr = mainHand.getType().getKey().toString();
         }
 
-        StringBuilder sb = new StringBuilder(256);
+        StringBuilder sb = new StringBuilder(logInventory ? 1024 : 256);
         sb.append(timeStr).append(" | ").append(player.getName()).append(" | ")
           .append(player.getWorld().getName()).append(':')
           .append(coordFormat.format(player.getX())).append(':')
           .append(coordFormat.format(player.getY())).append(':')
           .append(coordFormat.format(player.getZ())).append(" | ")
           .append(itemStr);
+
+        // 背包记录：统计所有非空槽位，按物品类型合并计数
+        if (logInventory) {
+            sb.append(" | INV ");
+            appendInventorySummary(sb, player);
+        }
+
         return sb.toString();
+    }
+
+    /**
+     * 统计玩家背包中所有非空物品并按类型合并计数，追加到 StringBuilder。
+     * 覆盖：36 主背包 + 副手 + 4 护甲，共 41 个槽位。
+     * 格式：{@code stone:5, dirt:3, iron_sword:1}
+     */
+    private void appendInventorySummary(StringBuilder sb, Player player) {
+        Map<String, Integer> counts = new LinkedHashMap<>();
+
+        // 扫描所有槽位并合并计数
+        for (ItemStack item : player.getInventory().getContents()) {
+            if (item != null && !item.getType().isAir()) {
+                counts.merge(item.getType().getKey().toString(), item.getAmount(), Integer::sum);
+            }
+        }
+        // 副手
+        ItemStack offHand = player.getInventory().getItemInOffHand();
+        if (offHand != null && !offHand.getType().isAir()) {
+            counts.merge(offHand.getType().getKey().toString(), offHand.getAmount(), Integer::sum);
+        }
+        // 护甲
+        for (ItemStack armor : player.getInventory().getArmorContents()) {
+            if (armor != null && !armor.getType().isAir()) {
+                counts.merge(armor.getType().getKey().toString(), armor.getAmount(), Integer::sum);
+            }
+        }
+
+        if (counts.isEmpty()) {
+            sb.append('-');
+            return;
+        }
+
+        boolean first = true;
+        for (Map.Entry<String, Integer> entry : counts.entrySet()) {
+            if (!first) sb.append(',');
+            sb.append(entry.getKey());
+            if (entry.getValue() > 1) {
+                sb.append(':').append(entry.getValue());
+            }
+            first = false;
+        }
     }
 
     // ─── 文件写入 ───────────────────────────────────────────────
@@ -718,5 +769,9 @@ public class MoveRecorder extends BukkitRunnable {
     /** 累计因 TPS 过低跳过的周期数 */
     public long getTotalTpsSkips() {
         return totalTpsSkips.get();
+    }
+
+    public boolean isLogInventory() {
+        return logInventory;
     }
 }
