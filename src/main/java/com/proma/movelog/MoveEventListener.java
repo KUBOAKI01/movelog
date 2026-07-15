@@ -167,7 +167,7 @@ public class MoveEventListener implements Listener {
 
     private void appendInventorySummary(StringBuilder sb, Player player) {
         Map<String, Integer> counts = new LinkedHashMap<>();
-        for (ItemStack item : player.getInventory().getContents()) {
+        for (ItemStack item : player.getInventory().getStorageContents()) {
             if (item != null && !item.getType().isAir()) {
                 counts.merge(item.getType().getKey().toString(), item.getAmount(), Integer::sum);
             }
