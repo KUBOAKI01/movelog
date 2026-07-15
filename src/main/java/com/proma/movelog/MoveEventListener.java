@@ -8,7 +8,6 @@ import org.bukkit.event.entity.PlayerDeathEvent;
 import org.bukkit.event.player.PlayerChangedWorldEvent;
 import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
-import org.bukkit.event.player.PlayerTeleportEvent;
 import org.bukkit.inventory.ItemStack;
 import io.papermc.paper.event.player.AsyncChatEvent;
 import net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer;
@@ -58,21 +57,21 @@ public class MoveEventListener implements Listener {
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
     public void onPlayerJoin(PlayerJoinEvent event) {
         Player player = event.getPlayer();
-        if (!isRealPlayer(player)) return;
+        if (!isRealPlayer(player) || !recorder.shouldRecord(player)) return;
         recorder.recordEvent(formatEvent(player, "JOIN"));
     }
 
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
     public void onPlayerQuit(PlayerQuitEvent event) {
         Player player = event.getPlayer();
-        if (!isRealPlayer(player)) return;
+        if (!isRealPlayer(player) || !recorder.shouldRecord(player)) return;
         recorder.recordEvent(formatEvent(player, "QUIT"));
     }
 
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
     public void onPlayerDeath(PlayerDeathEvent event) {
         Player player = event.getEntity();
-        if (!isRealPlayer(player)) return;
+        if (!isRealPlayer(player) || !recorder.shouldRecord(player)) return;
         String deathMsg = event.getDeathMessage();
         String cause = (deathMsg != null) ? deathMsg.replace(player.getName(), "").trim() : "unknown";
         recorder.recordEvent(formatEvent(player, "DEATH | " + cause));
@@ -81,31 +80,19 @@ public class MoveEventListener implements Listener {
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
     public void onPlayerChangedWorld(PlayerChangedWorldEvent event) {
         Player player = event.getPlayer();
-        if (!isRealPlayer(player)) return;
+        if (!isRealPlayer(player) || !recorder.shouldRecord(player)) return;
         String from = event.getFrom().getName();
         recorder.recordEvent(formatEvent(player, "WORLD_CHANGE | from=" + from));
     }
 
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
     public void onChat(AsyncChatEvent event) {
-        if (event.isCancelled()) return;
         Player player = event.getPlayer();
-        if (!isRealPlayer(player)) return;
+        if (!isRealPlayer(player) || !recorder.shouldRecord(player)) return;
         String msg = PlainTextComponentSerializer.plainText().serialize(event.message());
+        // 转义换行符防止破坏日志格式
+        msg = msg.replace('\n', ' ').replace('\r', ' ');
         recorder.recordChat(formatChat(player, msg));
-    }
-
-    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
-    public void onPlayerTeleport(PlayerTeleportEvent event) {
-        Player player = event.getPlayer();
-        if (!isRealPlayer(player)) return;
-        // 只记录跨世界传送（同世界传送太频繁，意义不大且刷屏）
-        if (event.getFrom().getWorld() != null
-                && event.getTo().getWorld() != null
-                && !event.getFrom().getWorld().equals(event.getTo().getWorld())) {
-            return; // 跨世界传送已由 PlayerChangedWorldEvent 处理
-        }
-        // 忽略同世界传送，减少日志噪音
     }
 
     // ─── 内部方法 ───────────────────────────────────────────────
@@ -136,11 +123,11 @@ public class MoveEventListener implements Listener {
 
         StringBuilder sb = new StringBuilder(logInventory ? 1024 : 256);
         sb.append(timeStr).append(" | ")
-          .append(player.getName()).append(" | ")
+          .append(safeName(player.getName())).append(" | ")
           .append(player.getWorld().getName()).append(':')
-          .append(String.format(java.util.Locale.US, "%.2f", player.getX())).append(':')
-          .append(String.format(java.util.Locale.US, "%.2f", player.getY())).append(':')
-          .append(String.format(java.util.Locale.US, "%.2f", player.getZ()))
+          .append(fmtCoord(player.getX())).append(':')
+          .append(fmtCoord(player.getY())).append(':')
+          .append(fmtCoord(player.getZ()))
           .append(" | ").append(itemStr);
 
         if (logInventory) {
@@ -160,13 +147,22 @@ public class MoveEventListener implements Listener {
         String timeStr = timeFormatter.format(ZonedDateTime.now(zoneId));
         return new StringBuilder(256)
                 .append(timeStr).append(" | ")
-                .append(player.getName()).append(" | ")
+                .append(safeName(player.getName())).append(" | ")
                 .append(player.getWorld().getName()).append(':')
-                .append(String.format(java.util.Locale.US, "%.2f", player.getX())).append(':')
-                .append(String.format(java.util.Locale.US, "%.2f", player.getY())).append(':')
-                .append(String.format(java.util.Locale.US, "%.2f", player.getZ()))
+                .append(fmtCoord(player.getX())).append(':')
+                .append(fmtCoord(player.getY())).append(':')
+                .append(fmtCoord(player.getZ()))
                 .append(" | ").append(message)
                 .toString();
+    }
+
+    private static String safeName(String name) {
+        return name.replace('|', '_').replace('\n', ' ').replace('\r', ' ');
+    }
+
+    private static String fmtCoord(double v) {
+        return Double.isFinite(v)
+                ? String.format(java.util.Locale.US, "%.2f", v) : "0.00";
     }
 
     private void appendInventorySummary(StringBuilder sb, Player player) {

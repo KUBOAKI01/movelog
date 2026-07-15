@@ -145,8 +145,8 @@ public class MoveRecorder extends BukkitRunnable {
                         int maxConsecutiveFailures, boolean eventLogEnabled, boolean logInventory,
                         File chatLogDir, int chatRotationHours) {
         // ── 参数校验 ──
-        if (bufferSize < 1) {
-            throw new IllegalArgumentException("buffer-size 必须 >= 1，当前值: " + bufferSize);
+        if (bufferSize < 1 || bufferSize > 1048576) {
+            throw new IllegalArgumentException("buffer-size 必须在 1-1048576（1MB）之间，当前值: " + bufferSize);
         }
         if (batchSize < 1) {
             throw new IllegalArgumentException("batch-size 必须 >= 1，当前值: " + batchSize);
@@ -186,6 +186,10 @@ public class MoveRecorder extends BukkitRunnable {
         this.eventLogEnabled = eventLogEnabled;
         this.logInventory = logInventory;
         this.chatLogDir = chatLogDir;
+        // 校验 chatRotationHours（防御性，正常路径已由 buildRecorderFromConfig 保证）
+        if (chatRotationHours < 1 || chatRotationHours > 24 || 24 % chatRotationHours != 0) {
+            throw new IllegalArgumentException("chat-rotation-hours 必须能被 24 整除且在 1-24 之间，当前值: " + chatRotationHours);
+        }
         this.chatRotationHours = chatRotationHours;
 
         this.zoneId = ZoneId.of(timezone);
@@ -220,7 +224,7 @@ public class MoveRecorder extends BukkitRunnable {
 
             // ── TPS 检测 ──
             double tps = Bukkit.getServer().getTPS()[0];
-            if (tps > 0 && tps < tpsThreshold) {
+            if (tps >= 0 && tps < tpsThreshold) {
                 totalTpsSkips.incrementAndGet();
                 plugin.getLogger().warning(String.format(
                         Locale.US, "TPS（%.1f）低于阈值（%.1f），跳过本轮记录。", tps, tpsThreshold));
@@ -280,7 +284,10 @@ public class MoveRecorder extends BukkitRunnable {
                 }
             }
 
-            if (lines.isEmpty()) return;
+            // 注意：即使 lines 为空，仍可能有聊天消息需写入
+            boolean hasChat = (chatLines != null && !chatLines.isEmpty());
+
+            if (lines.isEmpty() && !hasChat) return;
 
             // ── 分批写入 ──
             int written = 0;
@@ -299,7 +306,7 @@ public class MoveRecorder extends BukkitRunnable {
             }
 
             // ── 写入聊天日志 ──
-            if (chatLines != null && !chatLines.isEmpty()) {
+            if (hasChat) {
                 String chatBlockKey = computeChatBlockKey(now);
                 for (String cl : chatLines) {
                     try {
@@ -328,10 +335,9 @@ public class MoveRecorder extends BukkitRunnable {
     // ─── 过滤系统 ───────────────────────────────────────────────
 
     /**
-     * 判断是否应该记录指定玩家。
-     * 检查顺序：豁免权限 → 包含列表 → 排除列表 → 世界白名单 → 世界黑名单
+     * 判断是否应该记录指定玩家（公开方法，供事件监听器调用）。
      */
-    private boolean shouldRecord(Player player) {
+    public boolean shouldRecord(Player player) {
         // 权限豁免
         if (exemptPermission != null && player.hasPermission(exemptPermission)) {
             return false;
@@ -369,6 +375,7 @@ public class MoveRecorder extends BukkitRunnable {
      */
     public void recordEvent(String formattedLine) {
         if (!eventLogEnabled) return;
+        if (!enabled) return;
         if (shutdown) return;
         eventQueue.add(formattedLine);
     }
@@ -378,6 +385,7 @@ public class MoveRecorder extends BukkitRunnable {
      */
     public void recordChat(String formattedLine) {
         if (chatLogDir == null) return;
+        if (!enabled) return;
         if (shutdown) return;
         chatQueue.add(formattedLine);
     }
@@ -402,11 +410,12 @@ public class MoveRecorder extends BukkitRunnable {
         }
 
         StringBuilder sb = new StringBuilder(logInventory ? 1024 : 256);
-        sb.append(timeStr).append(" | ").append(player.getName()).append(" | ")
+        sb.append(timeStr).append(" | ")
+          .append(safeName(player.getName())).append(" | ")
           .append(player.getWorld().getName()).append(':')
-          .append(coordFormat.format(player.getX())).append(':')
-          .append(coordFormat.format(player.getY())).append(':')
-          .append(coordFormat.format(player.getZ())).append(" | ")
+          .append(fmtCoord(player.getX())).append(':')
+          .append(fmtCoord(player.getY())).append(':')
+          .append(fmtCoord(player.getZ())).append(" | ")
           .append(itemStr);
 
         // 背包记录：统计所有非空槽位，按物品类型合并计数
@@ -585,14 +594,6 @@ public class MoveRecorder extends BukkitRunnable {
                 return writer;
             }
 
-            // 失败计数检查
-            synchronized (writeFailCounts) {
-                Integer count = writeFailCounts.get(blockKey);
-                if (count != null && count >= maxConsecutiveFailures) {
-                    return null;
-                }
-            }
-
             File logFile = new File(moveLogDir, blockKey + ".log");
             boolean isNewFile = !logFile.exists();
 
@@ -645,7 +646,12 @@ public class MoveRecorder extends BukkitRunnable {
     private String computeChatBlockKey(ZonedDateTime now) {
         String dateStr = dateFormatter.format(now);
         int blockHour = (now.getHour() / chatRotationHours) * chatRotationHours;
-        return dateStr + "-" + PADDED_HOURS[blockHour];
+        String key = dateStr + "-" + PADDED_HOURS[blockHour];
+        if (key.contains("..") || key.contains("/") || key.contains("\\")) {
+            String safeDate = LocalDate.now(zoneId).toString();
+            return safeDate + "-" + PADDED_HOURS[blockHour];
+        }
+        return key;
     }
 
     private void appendToChatFile(String blockKey, String line) {
@@ -736,6 +742,10 @@ public class MoveRecorder extends BukkitRunnable {
                     closeSafely(w, key);
                 }
                 writerMap.remove(key);
+                // 清理对应的失败计数
+                synchronized (writeFailCounts) {
+                    writeFailCounts.remove(key);
+                }
                 // 清理 BOM 追踪（释放内存）
                 synchronized (bomWrittenFiles) {
                     bomWrittenFiles.remove(key);
@@ -748,7 +758,7 @@ public class MoveRecorder extends BukkitRunnable {
 
     // ─── 日志保留策略 ───────────────────────────────────────────
 
-    private transient LocalDate lastCleanupDate = null;
+    private LocalDate lastCleanupDate = null;
 
     /**
      * 每天首次调用时触发一次旧日志清理。
@@ -759,6 +769,9 @@ public class MoveRecorder extends BukkitRunnable {
         if (today.equals(lastCleanupDate)) return;
         lastCleanupDate = today;
         cleanOldLogs(now);
+        if (chatLogDir != null) {
+            cleanOldChatLogs(now);
+        }
     }
 
     /**
@@ -802,6 +815,40 @@ public class MoveRecorder extends BukkitRunnable {
         }
     }
 
+    private void cleanOldChatLogs(ZonedDateTime now) {
+        File[] files = chatLogDir.listFiles((dir, name) -> name.endsWith(".log"));
+        if (files == null || files.length == 0) return;
+
+        LocalDate cutoff = now.toLocalDate().minusDays(logRetentionDays);
+        int deleted = 0;
+
+        for (File f : files) {
+            try {
+                String name = f.getName();
+                if (name.length() < 10) continue;
+                String datePart = name.substring(0, 10);
+                LocalDate fileDate = LocalDate.parse(datePart, DateTimeFormatter.ISO_LOCAL_DATE);
+                if (fileDate.isBefore(cutoff)) {
+                    String blockKey = name.substring(0, name.lastIndexOf('.'));
+                    boolean isActive;
+                    chatWriterLock.lock();
+                    try {
+                        isActive = chatWriterMap.containsKey(blockKey);
+                    } finally {
+                        chatWriterLock.unlock();
+                    }
+                    if (!isActive && f.delete()) {
+                        deleted++;
+                    }
+                }
+            } catch (Exception ignored) {}
+        }
+
+        if (deleted > 0) {
+            plugin.getLogger().info("已清理 " + deleted + " 个过期聊天日志文件（保留 " + logRetentionDays + " 天）。");
+        }
+    }
+
     // ─── 生命周期管理 ───────────────────────────────────────────
 
     /**
@@ -811,6 +858,9 @@ public class MoveRecorder extends BukkitRunnable {
      * </p>
      */
     public void shutdown() {
+        // 0. 幂等检查
+        if (this.shutdown) return;
+
         // 1. 设置关闭标志，阻止新周期启动
         this.shutdown = true;
 
@@ -852,7 +902,7 @@ public class MoveRecorder extends BukkitRunnable {
     }
 
     /**
-     * 关闭前排出事件队列，将未写入的事件写入当前时间块。
+     * 关闭前排空事件队列。绕过 shutdown 检查直接写盘。
      */
     private void drainEventQueue() {
         ZonedDateTime now = ZonedDateTime.now(zoneId);
@@ -862,19 +912,34 @@ public class MoveRecorder extends BukkitRunnable {
         while ((line = eventQueue.poll()) != null) {
             batch.add(line);
         }
-        if (!batch.isEmpty()) {
-            try {
-                appendToFile(blockKey, batch);
-                plugin.getLogger().info("已排出 " + batch.size() + " 条待写入事件。");
-            } catch (Exception e) {
-                plugin.getLogger().log(Level.WARNING,
-                        "排出事件队列时发生错误: " + e.getMessage(), e);
+        if (batch.isEmpty()) return;
+
+        // 绕过 getOrCreateWriter 的 shutdown 检查，直接获取或创建 writer
+        writerLock.lock();
+        try {
+            BufferedWriter writer = writerMap.get(blockKey);
+            if (writer == null) {
+                writer = new BufferedWriter(
+                        new FileWriter(new File(moveLogDir, blockKey + ".log"),
+                                StandardCharsets.UTF_8, true), bufferSize);
+                writerMap.put(blockKey, writer);
             }
+            for (String l : batch) {
+                writer.write(l);
+                writer.newLine();
+            }
+            try { writer.flush(); } catch (IOException ignored) {}
+        } catch (IOException e) {
+            plugin.getLogger().log(Level.WARNING,
+                    "排出事件队列时发生错误: " + e.getMessage(), e);
+        } finally {
+            writerLock.unlock();
         }
+        plugin.getLogger().info("已排出 " + batch.size() + " 条待写入事件。");
     }
 
     /**
-     * 关闭前排出聊天队列。
+     * 关闭前排出聊天队列。绕过 shutdown 检查直接创建 writer 写盘。
      */
     private void drainChatQueue() {
         if (chatLogDir == null) return;
@@ -882,15 +947,35 @@ public class MoveRecorder extends BukkitRunnable {
         String blockKey = computeChatBlockKey(now);
         String cl;
         int count = 0;
-        while ((cl = chatQueue.poll()) != null) {
-            try {
-                appendToChatFile(blockKey, cl);
-                count++;
-            } catch (Exception e) {
-                plugin.getLogger().log(Level.WARNING,
-                        "排出聊天队列时发生错误: " + e.getMessage());
+
+        // 绕过 getOrCreateChatWriter 的 shutdown 检查，直接获取或创建 writer
+        chatWriterLock.lock();
+        try {
+            BufferedWriter writer = chatWriterMap.get(blockKey);
+            if (writer == null) {
+                writer = new BufferedWriter(
+                        new FileWriter(new File(chatLogDir, blockKey + ".log"),
+                                StandardCharsets.UTF_8, true), bufferSize);
+                chatWriterMap.put(blockKey, writer);
             }
+            while ((cl = chatQueue.poll()) != null) {
+                try {
+                    writer.write(cl);
+                    writer.newLine();
+                    count++;
+                } catch (IOException e) {
+                    plugin.getLogger().log(Level.WARNING,
+                            "排出聊天队列时发生错误: " + e.getMessage());
+                }
+            }
+            try { writer.flush(); } catch (IOException ignored) {}
+        } catch (IOException e) {
+            plugin.getLogger().log(Level.WARNING,
+                    "排出聊天队列时无法创建文件: " + e.getMessage());
+        } finally {
+            chatWriterLock.unlock();
         }
+
         if (count > 0) {
             plugin.getLogger().info("已排出 " + count + " 条待写入的聊天记录。");
         }
@@ -910,10 +995,6 @@ public class MoveRecorder extends BukkitRunnable {
         return tpsThreshold;
     }
 
-    public void setTpsThreshold(double tpsThreshold) {
-        this.tpsThreshold = tpsThreshold;
-    }
-
     /** 最近一次成功记录的时间戳（毫秒），0 表示尚未成功记录过 */
     public long getLastSuccessTime() {
         return lastSuccessTime.get();
@@ -929,7 +1010,13 @@ public class MoveRecorder extends BukkitRunnable {
         return totalTpsSkips.get();
     }
 
-    public boolean isLogInventory() {
-        return logInventory;
+    /** 消毒玩家名：防止 | \n \r 破坏日志格式 */
+    private static String safeName(String name) {
+        return name.replace('|', '_').replace('\n', ' ').replace('\r', ' ');
+    }
+
+    /** 安全格式化坐标（NaN/Infinity → 0.00） */
+    private String fmtCoord(double v) {
+        return Double.isFinite(v) ? coordFormat.format(v) : "0.00";
     }
 }
