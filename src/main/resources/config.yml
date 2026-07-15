@@ -1,5 +1,5 @@
 # PlayerMoveLog 配置文件
-# 修改后使用 /movelog reload 重新加载
+# 修改后使用 /movelog reload 重新加载（所有配置项均支持热重载）
 
 # 是否启用记录（默认开启）
 enabled: true
@@ -20,13 +20,12 @@ batch-threshold: 100
 # 每批写入的玩家记录数
 batch-size: 50
 
+# 日志文件切分间隔（小时），默认 4。取值必须能被 24 整除（1, 2, 3, 4, 6, 8, 12, 24）
+# 设为 4 → 每 4 小时一个文件；设为 24 → 按天分文件
+rotation-hours: 4
+
 # 时区（日志时间戳时区，默认 Asia/Shanghai = 北京时间 UTC+8）
 timezone: Asia/Shanghai
-
-# 日志文件切分间隔（小时），默认 4。取值必须能被 24 整除（1, 2, 3, 4, 6, 8, 12, 24）
-# 设为 4 表示每 4 小时一个文件：2026-07-14-00.log, 2026-07-14-04.log, ...
-# 设为 24 则恢复按天分文件（与旧版行为一致）
-rotation-hours: 4
 
 # 日期格式（用于日志文件名中的日期部分）
 date-format: yyyy-MM-dd
@@ -35,4 +34,52 @@ date-format: yyyy-MM-dd
 time-format: yyyy-MM-dd HH:mm:ss
 
 # 输出目录名（位于服务器根目录下，与 world 同级）
+# 不能包含 .. / \ 等路径穿越字符
 output-dir: movelog
+
+# 日志保留天数（-1 = 永久保留，0 = 不保留，>0 = 保留最近 N 天）
+# 每天首次记录时自动清理过期文件
+log-retention-days: 30
+
+# Excel UTF-8 BOM 兼容（开启后新文件头部写入 BOM，Excel 打开中文不乱码）
+# 注意：BOM 可能影响部分 Linux 解析工具
+excel-bom: false
+
+# 空手时显示的文本（可改为 "empty"、"none"、"AIR" 等）
+item-empty-text: "空"
+
+# 连续 I/O 失败多少次后暂停对该文件块的写入（防止磁盘满时死循环）
+max-consecutive-failures: 3
+
+# 查询命令 (/movelog search) 每页返回的行数
+search-lines: 20
+
+# ─── 事件记录 ──────────────────────────────────────
+
+event-logging:
+  # 是否启用事件驱动记录
+  # 开启后会在玩家加入/退出/死亡/跨世界切换时立即记录
+  enabled: true
+
+# ─── 过滤系统 ─────────────────────────────────────
+
+filter:
+  # 权限豁免：拥有此权限节点的玩家不会被记录
+  # 例：exempt-permission: "movelog.exempt"
+  exempt-permission: ""
+
+  # 世界白名单（非空时只记录这些世界中的玩家）
+  # 例：world-whitelist: ["world", "world_nether"]
+  world-whitelist: []
+
+  # 世界黑名单（不记录这些世界中的玩家，优先于白名单）
+  # 例：world-blacklist: ["minigame_world"]
+  world-blacklist: []
+
+  # 排除的玩家名
+  # 例：excluded-players: ["AdminBot"]
+  excluded-players: []
+
+  # 包含的玩家名（非空时只记录这些玩家，优先级最高）
+  # 例：included-players: ["Steve", "Alex"]
+  included-players: []

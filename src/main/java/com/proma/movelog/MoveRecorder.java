@@ -13,11 +13,14 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.text.DecimalFormat;
 import java.text.DecimalFormatSymbols;
+import java.time.LocalDate;
 import java.time.ZoneId;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.logging.Level;
 
@@ -31,13 +34,31 @@ import java.util.logging.Level;
  * <h3>性能设计</h3>
  * <ul>
  *   <li>线程优先级设为 {@code Thread.MIN_PRIORITY}，由操作系统调度到低负载核心。</li>
- *   <li>使用 {@link BufferedWriter}（8 KiB 缓冲区）合并批量写入。</li>
+ *   <li>使用 {@link BufferedWriter}（可配置缓冲区大小）合并批量写入。</li>
  *   <li>玩家数超过阈值时启用分批写入，避免单次 I/O 过大。</li>
  *   <li>TPS 低于阈值自动跳过本周期，保护服务器主循环。</li>
- *   <li>所有异常均在插件日志中静默记录，绝不抛出到主线程。</li>
+ *   <li>故障计数器 + 退避策略防止磁盘满时 I/O 风暴。</li>
+ *   <li>事件队列（ConcurrentLinkedQueue）支持主线程安全推送事件日志行。</li>
+ * </ul>
+ *
+ * <h3>线程安全</h3>
+ * <ul>
+ *   <li>{@link AtomicBoolean} running 保证同时只有一个周期在执行。</li>
+ *   <li>{@link ReentrantLock} writerLock 保护 writerMap 的所有访问。</li>
+ *   <li>{@code volatile} shutdown / enabled / tpsThreshold 保证跨线程可见性。</li>
+ *   <li>{@link ConcurrentLinkedQueue} 事件队列无锁线程安全。</li>
  * </ul>
  */
 public class MoveRecorder extends BukkitRunnable {
+
+    // ─── 预计算常量 ─────────────────────────────────────────────
+
+    /** 00..23 零填充字符串，替代 String.format("%02d", hour) 消除 Formatter 分配 */
+    private static final String[] PADDED_HOURS = {
+        "00", "01", "02", "03", "04", "05", "06", "07",
+        "08", "09", "10", "11", "12", "13", "14", "15",
+        "16", "17", "18", "19", "20", "21", "22", "23"
+    };
 
     // ─── 依赖与配置 ─────────────────────────────────────────────
 
@@ -52,35 +73,67 @@ public class MoveRecorder extends BukkitRunnable {
     private final ZoneId zoneId;
     private final DateTimeFormatter dateFormatter;
     private final DateTimeFormatter timeFormatter;
+    private final int logRetentionDays;
+    private final boolean excelBom;
+    private final String emptyItemText;
+    private final String exemptPermission;
+    private final Set<String> worldWhitelist;
+    private final Set<String> worldBlacklist;
+    private final Set<String> excludedPlayers;
+    private final Set<String> includedPlayers;
+    private final int maxConsecutiveFailures;
+    private final boolean eventLogEnabled;
 
-    /** 坐标格式化器（DecimalFormat 非线程安全，但 AtomicBoolean 保证单线程调用） */
+    /** 坐标格式化器（DecimalFormat 非线程安全，由 AtomicBoolean running 保证单线程调用） */
     private final DecimalFormat coordFormat =
             new DecimalFormat("0.00", DecimalFormatSymbols.getInstance(Locale.US));
 
     // ─── 运行时状态 ─────────────────────────────────────────────
 
-    /** 按时间块映射的缓冲写入器，使用 HashMap + ReentrantLock 保证线程安全 */
+    /** 按时间块映射的缓冲写入器 */
     private final Map<String, BufferedWriter> writerMap = new HashMap<>();
 
-    /** 用于 writerMap 的并发保护 */
+    /** writerMap 的并发保护 */
     private final ReentrantLock writerLock = new ReentrantLock();
 
-    /** 是否正在执行中（防重入，AtomicBoolean 提供原子 check-then-set） */
+    /** 是否正在执行中（防重入） */
     private final AtomicBoolean running = new AtomicBoolean(false);
 
-    /** 是否已关闭（防止 shutdown 后旧 recorder 再创建新文件句柄） */
+    /** 是否已关闭 */
     private volatile boolean shutdown = false;
 
-    /** 线程属性是否已初始化（仅首次 run 时设置） */
+    /** 线程属性是否已初始化 */
     private volatile boolean threadConfigured = false;
+
+    /** 最近一次成功记录的时间戳（毫秒），用于健康检查 */
+    private final AtomicLong lastSuccessTime = new AtomicLong(0);
+
+    /** 连续 I/O 失败次数（按 blockKey 记录），用于退避策略 */
+    private final Map<String, Integer> writeFailCounts = new HashMap<>();
+
+    /** 主线程推送的事件日志行队列（无锁线程安全） */
+    private final ConcurrentLinkedQueue<String> eventQueue = new ConcurrentLinkedQueue<>();
+
+    /** 累计记录条数 */
+    private final AtomicLong totalRecords = new AtomicLong(0);
+
+    /** 累计跳过周期数（TPS 过低） */
+    private final AtomicLong totalTpsSkips = new AtomicLong(0);
+
+    /** BOM 是否已写入（每个新文件只写一次） */
+    private final Set<String> bomWrittenFiles = new HashSet<>();
 
     // ─── 构造 ───────────────────────────────────────────────────
 
     public MoveRecorder(Plugin plugin, File moveLogDir, double tpsThreshold,
                         int bufferSize, int batchThreshold, int batchSize,
                         int rotationHours, String timezone, String dateFormat, String timeFormat,
-                        boolean enabled) {
-        // 参数校验：防止无效配置导致无限循环或运行时异常
+                        boolean enabled, int logRetentionDays, boolean excelBom,
+                        String emptyItemText, String exemptPermission,
+                        List<String> worldWhitelistRaw, List<String> worldBlacklistRaw,
+                        List<String> excludedPlayersRaw, List<String> includedPlayersRaw,
+                        int maxConsecutiveFailures, boolean eventLogEnabled) {
+        // ── 参数校验 ──
         if (bufferSize < 1) {
             throw new IllegalArgumentException("buffer-size 必须 >= 1，当前值: " + bufferSize);
         }
@@ -96,6 +149,11 @@ public class MoveRecorder extends BukkitRunnable {
         if (!Double.isFinite(tpsThreshold)) {
             throw new IllegalArgumentException("tps-threshold 必须是有限数值，当前值: " + tpsThreshold);
         }
+        // 输出目录路径穿越防护
+        String dirPath = moveLogDir.getAbsolutePath();
+        if (dirPath.contains("..") || moveLogDir.getPath().contains("..")) {
+            throw new IllegalArgumentException("output-dir 包含非法路径字符 (..): " + moveLogDir.getPath());
+        }
 
         this.plugin = plugin;
         this.moveLogDir = moveLogDir;
@@ -105,6 +163,16 @@ public class MoveRecorder extends BukkitRunnable {
         this.batchSize = batchSize;
         this.rotationHours = rotationHours;
         this.enabled = enabled;
+        this.logRetentionDays = logRetentionDays;
+        this.excelBom = excelBom;
+        this.emptyItemText = emptyItemText;
+        this.exemptPermission = (exemptPermission != null && !exemptPermission.isEmpty()) ? exemptPermission : null;
+        this.worldWhitelist = (worldWhitelistRaw != null) ? new HashSet<>(worldWhitelistRaw) : Collections.emptySet();
+        this.worldBlacklist = (worldBlacklistRaw != null) ? new HashSet<>(worldBlacklistRaw) : Collections.emptySet();
+        this.excludedPlayers = (excludedPlayersRaw != null) ? new HashSet<>(excludedPlayersRaw) : Collections.emptySet();
+        this.includedPlayers = (includedPlayersRaw != null) ? new HashSet<>(includedPlayersRaw) : Collections.emptySet();
+        this.maxConsecutiveFailures = Math.max(1, maxConsecutiveFailures);
+        this.eventLogEnabled = eventLogEnabled;
 
         this.zoneId = ZoneId.of(timezone);
         this.dateFormatter = DateTimeFormatter.ofPattern(dateFormat).withZone(zoneId);
@@ -115,11 +183,9 @@ public class MoveRecorder extends BukkitRunnable {
 
     @Override
     public void run() {
-        // ── 已关闭则不执行 ──
         if (shutdown) return;
         if (!enabled) return;
 
-        // ── 防重入保护：原子 check-then-set，消除 TOCTOU 窗口 ──
         if (!running.compareAndSet(false, true)) {
             plugin.getLogger().warning("上一轮记录尚未完成，跳过本轮。");
             return;
@@ -134,78 +200,146 @@ public class MoveRecorder extends BukkitRunnable {
                     currentThread.setName("PlayerMoveLog-Worker");
                     threadConfigured = true;
                 } catch (SecurityException ignored) {
-                    // 极少见：SecurityManager 禁止修改线程属性，不影响核心功能
+                    // SecurityManager 禁止修改线程属性，不影响核心功能
                 }
             }
 
             // ── TPS 检测 ──
             double tps = Bukkit.getServer().getTPS()[0];
             if (tps > 0 && tps < tpsThreshold) {
+                totalTpsSkips.incrementAndGet();
                 plugin.getLogger().warning(String.format(
-                        "TPS（%.1f）低于阈值（%.1f），跳过本轮记录。", tps, tpsThreshold));
+                        Locale.US, "TPS（%.1f）低于阈值（%.1f），跳过本轮记录。", tps, tpsThreshold));
                 return;
             }
 
-            // ── 玩家列表 ──
+            // ── 获取在线玩家 ──
             Collection<? extends Player> players;
             try {
                 players = Bukkit.getOnlinePlayers();
             } catch (Exception e) {
-                plugin.getLogger().log(Level.WARNING, "获取在线玩家列表失败: " + e.getMessage(), e);
+                plugin.getLogger().log(Level.WARNING,
+                        "获取在线玩家列表失败: " + e.getMessage(), e);
                 return;
             }
-
-            if (players.isEmpty()) return;
 
             // ── 时间戳 ──
             ZonedDateTime now = ZonedDateTime.now(zoneId);
             String timeStr = timeFormatter.format(now);
             String blockKey = computeBlockKey(now);
 
-            // ── 格式化日志行 ──
-            List<String> lines = new ArrayList<>(players.size());
-            for (Player player : players) {
-                try {
-                    // 跳过 NPC / 假玩家：真玩家一定有网络地址，NPC 的 getAddress() 返回 null
-                    if (player.getAddress() == null) {
-                        continue;
+            // ── 每日日志清理（每天首次进入新 block 时触发一次）──
+            cleanOldLogsIfDue(now);
+
+            // ── 排出事件队列 ──
+            List<String> lines = new ArrayList<>();
+            String eventLine;
+            while ((eventLine = eventQueue.poll()) != null) {
+                lines.add(eventLine);
+            }
+
+            // ── 格式化玩家数据 ──
+            if (!players.isEmpty()) {
+                for (Player player : players) {
+                    try {
+                        if (player.getAddress() == null) continue; // 跳过 NPC
+
+                        // 过滤系统
+                        if (!shouldRecord(player)) continue;
+
+                        lines.add(formatLogLine(player, timeStr));
+                    } catch (Exception e) {
+                        // 单个玩家格式化失败不应影响整体，使用 FINE 级别避免告警疲劳
+                        plugin.getLogger().log(Level.FINE,
+                                "格式化玩家 " + player.getName() + " 数据失败: " + e.getMessage());
                     }
-                    lines.add(formatLogLine(player, timeStr));
-                } catch (Exception e) {
-                    plugin.getLogger().log(Level.WARNING,
-                            "格式化玩家 " + player.getName() + " 数据失败: " + e.getMessage());
-                    // 继续处理下一个玩家
                 }
             }
 
-            // ── 分批写入 ──
             if (lines.isEmpty()) return;
 
+            // ── 分批写入 ──
+            int written = 0;
             if (lines.size() > batchThreshold) {
                 for (int i = 0; i < lines.size(); i += batchSize) {
                     int end = Math.min(i + batchSize, lines.size());
-                    appendToFile(blockKey, lines.subList(i, end));
+                    written += appendToFile(blockKey, lines.subList(i, end));
                 }
             } else {
-                appendToFile(blockKey, lines);
+                written = appendToFile(blockKey, lines);
+            }
+
+            if (written > 0) {
+                totalRecords.addAndGet(written);
+                lastSuccessTime.set(System.currentTimeMillis());
             }
 
             // ── 滚动清理：关闭已过期时间块的旧文件句柄 ──
             cleanupStaleWriters(blockKey);
 
-        } catch (Exception e) {
-            plugin.getLogger().log(Level.WARNING,
-                    "[PlayerMoveLog] 记录过程中发生异常: " + e.getMessage(), e);
+        } catch (Throwable t) {
+            // 捕获 Error 和 Exception，防止杀死异步线程
+            // ThreadDeath 在 Java 21+ 已废弃且不再触发，无需特殊处理
+            plugin.getLogger().log(Level.SEVERE,
+                    "[PlayerMoveLog] 记录过程中发生不可恢复错误: " + t.getMessage(), t);
         } finally {
             running.set(false);
         }
+    }
+
+    // ─── 过滤系统 ───────────────────────────────────────────────
+
+    /**
+     * 判断是否应该记录指定玩家。
+     * 检查顺序：豁免权限 → 包含列表 → 排除列表 → 世界白名单 → 世界黑名单
+     */
+    private boolean shouldRecord(Player player) {
+        // 权限豁免
+        if (exemptPermission != null && player.hasPermission(exemptPermission)) {
+            return false;
+        }
+        // 包含列表（非空时只记录列表中的玩家）
+        if (!includedPlayers.isEmpty() && !includedPlayers.contains(player.getName())) {
+            return false;
+        }
+        // 排除列表
+        if (excludedPlayers.contains(player.getName())) {
+            return false;
+        }
+        String worldName = player.getWorld().getName();
+        // 世界白名单（非空时只记录白名单中的世界）
+        if (!worldWhitelist.isEmpty() && !worldWhitelist.contains(worldName)) {
+            return false;
+        }
+        // 世界黑名单
+        if (worldBlacklist.contains(worldName)) {
+            return false;
+        }
+        return true;
+    }
+
+    // ─── 事件记录（主线程安全）───────────────────────────────────
+
+    /**
+     * 从主线程安全地推送一条事件日志行。
+     * <p>
+     * 调用者负责格式化字符串，此方法仅将格式化后的行入队。
+     * 实际文件 I/O 在下一次 {@link #run()} 周期中完成。
+     * </p>
+     *
+     * @param formattedLine 已格式化的完整日志行（含事件类型标记）
+     */
+    public void recordEvent(String formattedLine) {
+        if (!eventLogEnabled) return;
+        if (shutdown) return;
+        eventQueue.add(formattedLine);
     }
 
     // ─── 日志行格式化 ───────────────────────────────────────────
 
     /**
      * 按固定格式构造一条日志行：
-     * {@code 时间 | 玩家名 | 世界名:X:Y:Z | 主手物品}
+     * {@code 时间 | 玩家名 | 世界:X:Y:Z | 主手物品}
      * <p>
      * 使用 Entity.getX/Y/Z() 替代 getLocation() 避免每次分配 Location 对象；
      * 使用 StringBuilder + DecimalFormat 替代 String.format 避免每次分配 Formatter。
@@ -215,12 +349,12 @@ public class MoveRecorder extends BukkitRunnable {
         ItemStack mainHand = player.getInventory().getItemInMainHand();
         String itemStr;
         if (mainHand == null || mainHand.getType().isAir()) {
-            itemStr = "空";
+            itemStr = emptyItemText;
         } else {
             itemStr = mainHand.getType().getKey().toString();
         }
 
-        StringBuilder sb = new StringBuilder(128);
+        StringBuilder sb = new StringBuilder(256);
         sb.append(timeStr).append(" | ").append(player.getName()).append(" | ")
           .append(player.getWorld().getName()).append(':')
           .append(coordFormat.format(player.getX())).append(':')
@@ -235,62 +369,83 @@ public class MoveRecorder extends BukkitRunnable {
     /**
      * 计算当前时间所属的文件名块键。
      * <p>
-     * 例如 rotationHours=4 时，hour 0-3 → "00"，4-7 → "04"，以此类推。
-     * 文件名 = {@code dateStr + "-" + blockHour + ".log"}。
+     * 使用预计算 PADDED_HOURS 数组替代 String.format，零分配。
      * </p>
      */
     private String computeBlockKey(ZonedDateTime now) {
         String dateStr = dateFormatter.format(now);
         int blockHour = (now.getHour() / rotationHours) * rotationHours;
-        String key = dateStr + "-" + String.format(Locale.US, "%02d", blockHour);
+        String key = dateStr + "-" + PADDED_HOURS[blockHour];
         // 防止恶意 date-format 配置导致路径穿越
         if (key.contains("..") || key.contains("/") || key.contains("\\")) {
             plugin.getLogger().severe("日志文件名包含非法字符（路径穿越风险）: " + key);
-            // 回退到安全的默认键名（纯日期 + 小时块）
-            String safeDate = java.time.LocalDate.now(zoneId).toString();
-            return safeDate + "-" + String.format(Locale.US, "%02d", blockHour);
+            String safeDate = LocalDate.now(zoneId).toString();
+            return safeDate + "-" + PADDED_HOURS[blockHour];
         }
         return key;
     }
 
     /**
      * 将一批日志行追加写入指定时间块的文件中。
-     * <p>
-     * 使用 {@link BufferedWriter} 做缓冲写入；若文件无法创建则静默记录错误。
-     * </p>
+     *
+     * @return 成功写入的行数
      */
-    private void appendToFile(String blockKey, List<String> lines) {
+    private int appendToFile(String blockKey, List<String> lines) {
+        // 退避检查：连续失败超过阈值时拒绝写入
+        synchronized (writeFailCounts) {
+            Integer count = writeFailCounts.get(blockKey);
+            if (count != null && count >= maxConsecutiveFailures) {
+                // 不重复记录日志（由 getOrCreateWriter 首次失败时输出 SEVERE）
+                return 0;
+            }
+        }
+
         BufferedWriter writer = null;
         try {
             writer = getOrCreateWriter(blockKey);
-            if (writer == null) return;
+            if (writer == null) return 0;
 
             for (String line : lines) {
                 writer.write(line);
                 writer.newLine();
             }
             writer.flush();
+
+            // 重置该 block 的失败计数器
+            synchronized (writeFailCounts) {
+                writeFailCounts.remove(blockKey);
+            }
+            return lines.size();
+
         } catch (IOException e) {
-            // 写入失败时清除损坏的 writer，下次调用会重新创建
+            // 记录失败次数
+            int failCount;
+            synchronized (writeFailCounts) {
+                failCount = writeFailCounts.merge(blockKey, 1, Integer::sum);
+            }
+            if (failCount == 1) {
+                plugin.getLogger().log(Level.WARNING,
+                        "写入日志文件失败 (块=" + blockKey + ")，第 1 次: " + e.getMessage(), e);
+            } else if (failCount == maxConsecutiveFailures) {
+                plugin.getLogger().log(Level.SEVERE,
+                        "写入日志文件连续失败 " + failCount + " 次 (块=" + blockKey
+                        + ")，已暂停对该文件块的写入。请检查磁盘空间！");
+            }
             removeWriter(blockKey);
-            plugin.getLogger().log(Level.WARNING,
-                    "写入日志文件失败 (块=" + blockKey + ")，已清除损坏的写入器: " + e.getMessage(), e);
+            return 0;
         }
     }
 
     /**
-     * 安全移除并关闭指定时间块的 BufferedWriter（通常用于损坏的 writer 清理）。
+     * 安全移除并关闭指定时间块的 BufferedWriter。
+     * close 失败时重试一次，防止文件句柄泄漏。
      */
     private void removeWriter(String blockKey) {
         writerLock.lock();
         try {
             BufferedWriter w = writerMap.remove(blockKey);
             if (w != null) {
-                try {
-                    w.close();
-                } catch (IOException ignored) {
-                    // 损坏的 writer 关闭时再次抛异常是预期行为
-                }
+                closeSafely(w, blockKey);
             }
         } finally {
             writerLock.unlock();
@@ -298,22 +453,91 @@ public class MoveRecorder extends BukkitRunnable {
     }
 
     /**
+     * 安全关闭 BufferedWriter：flush → close，失败重试一次。
+     */
+    private void closeSafely(BufferedWriter w, String key) {
+        try {
+            w.flush();
+        } catch (IOException e) {
+            plugin.getLogger().log(Level.WARNING,
+                    "刷新写入器失败 (" + key + "): " + e.getMessage());
+        }
+        try {
+            w.close();
+        } catch (IOException e) {
+            // 重试一次
+            try {
+                w.close();
+            } catch (IOException ignored) {
+                plugin.getLogger().log(Level.WARNING,
+                        "关闭写入器失败（重试后仍失败）(" + key + ")，句柄可能泄漏: " + e.getMessage());
+            }
+        }
+    }
+
+    /**
      * 获取或创建指定时间块的 BufferedWriter。
+     * 文件被外部锁定时最多重试 2 次（间隔 100ms）。
      */
     private BufferedWriter getOrCreateWriter(String blockKey) throws IOException {
         writerLock.lock();
         try {
-            // shutdown 后拒绝创建新 writer（防止并发窗口中的句柄泄漏）
             if (shutdown) return null;
 
             BufferedWriter writer = writerMap.get(blockKey);
             if (writer != null) {
                 return writer;
             }
+
+            // 失败计数检查
+            synchronized (writeFailCounts) {
+                Integer count = writeFailCounts.get(blockKey);
+                if (count != null && count >= maxConsecutiveFailures) {
+                    return null;
+                }
+            }
+
             File logFile = new File(moveLogDir, blockKey + ".log");
-            writer = new BufferedWriter(new FileWriter(logFile, StandardCharsets.UTF_8, true), bufferSize);
+            boolean isNewFile = !logFile.exists();
+
+            // 文件锁重试（最多 3 次，间隔 100ms）
+            IOException lastException = null;
+            for (int attempt = 0; attempt < 3; attempt++) {
+                try {
+                    writer = new BufferedWriter(
+                            new FileWriter(logFile, StandardCharsets.UTF_8, true), bufferSize);
+                    break;
+                } catch (IOException e) {
+                    lastException = e;
+                    if (attempt < 2) {
+                        try {
+                            Thread.sleep(100);
+                        } catch (InterruptedException ignored) {
+                            Thread.currentThread().interrupt();
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (writer == null) {
+                throw lastException != null ? lastException
+                        : new IOException("无法创建日志文件写入器: " + logFile.getName());
+            }
+
             writerMap.put(blockKey, writer);
             plugin.getLogger().info("创建日志文件: " + logFile.getName());
+
+            // Excel BOM：新文件写入 UTF-8 BOM
+            if (excelBom && isNewFile) {
+                synchronized (bomWrittenFiles) {
+                    if (!bomWrittenFiles.contains(blockKey)) {
+                        writer.write('﻿');
+                        bomWrittenFiles.add(blockKey);
+                    }
+                }
+            }
+
             return writer;
         } finally {
             writerLock.unlock();
@@ -322,6 +546,7 @@ public class MoveRecorder extends BukkitRunnable {
 
     /**
      * 关闭非当前时间块的文件写入器，释放文件句柄。
+     * 先 flush/close 再从 map 移除，防止 close 失败时句柄泄漏。
      */
     private void cleanupStaleWriters(String currentBlockKey) {
         writerLock.lock();
@@ -333,21 +558,14 @@ public class MoveRecorder extends BukkitRunnable {
                 }
             }
             for (String key : stale) {
-                BufferedWriter w = writerMap.remove(key);
+                BufferedWriter w = writerMap.get(key);
                 if (w != null) {
-                    try {
-                        w.flush();
-                    } catch (IOException e) {
-                        plugin.getLogger().log(Level.WARNING,
-                                "刷新写入器失败 (" + key + ".log): " + e.getMessage());
-                    }
-                    try {
-                        w.close();
-                        plugin.getLogger().info("已关闭过期日志文件写入器: " + key + ".log");
-                    } catch (IOException e) {
-                        plugin.getLogger().log(Level.WARNING,
-                                "关闭写入器失败 (" + key + ".log): " + e.getMessage());
-                    }
+                    closeSafely(w, key);
+                }
+                writerMap.remove(key);
+                // 清理 BOM 追踪（释放内存）
+                synchronized (bomWrittenFiles) {
+                    bomWrittenFiles.remove(key);
                 }
             }
         } finally {
@@ -355,36 +573,117 @@ public class MoveRecorder extends BukkitRunnable {
         }
     }
 
+    // ─── 日志保留策略 ───────────────────────────────────────────
+
+    private transient LocalDate lastCleanupDate = null;
+
+    /**
+     * 每天首次调用时触发一次旧日志清理。
+     */
+    private void cleanOldLogsIfDue(ZonedDateTime now) {
+        if (logRetentionDays < 0) return;
+        LocalDate today = now.toLocalDate();
+        if (today.equals(lastCleanupDate)) return;
+        lastCleanupDate = today;
+        cleanOldLogs(now);
+    }
+
+    /**
+     * 删除超过保留天数的日志文件。
+     */
+    private void cleanOldLogs(ZonedDateTime now) {
+        File[] files = moveLogDir.listFiles((dir, name) -> name.endsWith(".log"));
+        if (files == null || files.length == 0) return;
+
+        LocalDate cutoff = now.toLocalDate().minusDays(logRetentionDays);
+        int deleted = 0;
+
+        for (File f : files) {
+            try {
+                String name = f.getName();
+                // 文件名格式: yyyy-MM-dd-HH.log，提取日期部分（前 10 个字符）
+                if (name.length() < 10) continue;
+                String datePart = name.substring(0, 10);
+                LocalDate fileDate = LocalDate.parse(datePart, DateTimeFormatter.ISO_LOCAL_DATE);
+                if (fileDate.isBefore(cutoff)) {
+                    // 确保文件没有被当前 writer 持有
+                    String blockKey = name.substring(0, name.lastIndexOf('.'));
+                    boolean isActive;
+                    writerLock.lock();
+                    try {
+                        isActive = writerMap.containsKey(blockKey);
+                    } finally {
+                        writerLock.unlock();
+                    }
+                    if (!isActive && f.delete()) {
+                        deleted++;
+                    }
+                }
+            } catch (Exception ignored) {
+                // 文件名不符合预期格式，跳过
+            }
+        }
+
+        if (deleted > 0) {
+            plugin.getLogger().info("已清理 " + deleted + " 个过期日志文件（保留 " + logRetentionDays + " 天）。");
+        }
+    }
+
     // ─── 生命周期管理 ───────────────────────────────────────────
 
     /**
-     * 关闭插件时调用：强制刷新并关闭所有文件写入器，防止数据丢失。
+     * 关闭插件时调用：等待当前 run() 完成 → 刷新事件队列 → 强制刷新并关闭所有文件写入器。
+     * <p>
+     * 使用"等待 running → 获取锁 → close"顺序消除 shutdown 与 run() 之间的竞态窗口。
+     * </p>
      */
     public void shutdown() {
-        // 设置关闭标志（在获取锁之前），防止并发 run() 在 writerMap 被清空后
-        // 重新创建 writer 导致句柄泄漏
+        // 1. 设置关闭标志，阻止新周期启动
         this.shutdown = true;
 
+        // 2. 等待正在执行的 run() 完成（最多 10 秒）
+        long deadline = System.currentTimeMillis() + 10_000;
+        while (running.get() && System.currentTimeMillis() < deadline) {
+            Thread.yield();
+        }
+        if (running.get()) {
+            plugin.getLogger().warning("等待记录周期完成超时（10 秒），将强制关闭。");
+        }
+
+        // 3. 排出事件队列中的剩余事件（写入当前活动的时间块）
+        drainEventQueue();
+
+        // 4. 安全关闭所有 writer
         writerLock.lock();
         try {
             for (Map.Entry<String, BufferedWriter> entry : writerMap.entrySet()) {
-                try {
-                    entry.getValue().flush();
-                } catch (IOException e) {
-                    plugin.getLogger().log(Level.WARNING,
-                            "刷新日志文件失败 (" + entry.getKey() + ".log): " + e.getMessage());
-                }
-                try {
-                    entry.getValue().close();
-                    plugin.getLogger().info("已安全关闭日志文件: " + entry.getKey() + ".log");
-                } catch (IOException e) {
-                    plugin.getLogger().log(Level.WARNING,
-                            "关闭日志文件失败 (" + entry.getKey() + ".log): " + e.getMessage());
-                }
+                closeSafely(entry.getValue(), entry.getKey());
             }
             writerMap.clear();
         } finally {
             writerLock.unlock();
+        }
+    }
+
+    /**
+     * 关闭前排出事件队列，将未写入的事件写入当前时间块。
+     */
+    private void drainEventQueue() {
+        ZonedDateTime now = ZonedDateTime.now(zoneId);
+        String blockKey = computeBlockKey(now);
+        List<String> batch = new ArrayList<>();
+        String line;
+        while ((line = eventQueue.poll()) != null) {
+            batch.add(line);
+        }
+        if (!batch.isEmpty()) {
+            try {
+                appendToFile(blockKey, batch);
+                plugin.getLogger().info("已排出 " + batch.size() + " 条待写入事件。");
+            } catch (Exception e) {
+                plugin.getLogger().log(Level.WARNING,
+                        "排出事件队列时发生错误: " + e.getMessage(), e);
+            }
         }
     }
 
@@ -404,5 +703,20 @@ public class MoveRecorder extends BukkitRunnable {
 
     public void setTpsThreshold(double tpsThreshold) {
         this.tpsThreshold = tpsThreshold;
+    }
+
+    /** 最近一次成功记录的时间戳（毫秒），0 表示尚未成功记录过 */
+    public long getLastSuccessTime() {
+        return lastSuccessTime.get();
+    }
+
+    /** 累计成功记录的日志行数 */
+    public long getTotalRecords() {
+        return totalRecords.get();
+    }
+
+    /** 累计因 TPS 过低跳过的周期数 */
+    public long getTotalTpsSkips() {
+        return totalTpsSkips.get();
     }
 }
