@@ -10,6 +10,8 @@ import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.event.player.PlayerTeleportEvent;
 import org.bukkit.inventory.ItemStack;
+import io.papermc.paper.event.player.AsyncChatEvent;
+import net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer;
 
 import java.time.ZoneId;
 import java.time.ZonedDateTime;
@@ -85,6 +87,15 @@ public class MoveEventListener implements Listener {
     }
 
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    public void onChat(AsyncChatEvent event) {
+        if (event.isCancelled()) return;
+        Player player = event.getPlayer();
+        if (!isRealPlayer(player)) return;
+        String msg = PlainTextComponentSerializer.plainText().serialize(event.message());
+        recorder.recordChat(formatChat(player, msg));
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
     public void onPlayerTeleport(PlayerTeleportEvent event) {
         Player player = event.getPlayer();
         if (!isRealPlayer(player)) return;
@@ -139,6 +150,23 @@ public class MoveEventListener implements Listener {
 
         sb.append(" | EVENT:").append(eventType);
         return sb.toString();
+    }
+
+    /**
+     * 格式化聊天日志行。
+     * 格式：{@code 时间 | 玩家名 | 世界:X:Y:Z | 消息内容}
+     */
+    private String formatChat(Player player, String message) {
+        String timeStr = timeFormatter.format(ZonedDateTime.now(zoneId));
+        return new StringBuilder(256)
+                .append(timeStr).append(" | ")
+                .append(player.getName()).append(" | ")
+                .append(player.getWorld().getName()).append(':')
+                .append(String.format(java.util.Locale.US, "%.2f", player.getX())).append(':')
+                .append(String.format(java.util.Locale.US, "%.2f", player.getY())).append(':')
+                .append(String.format(java.util.Locale.US, "%.2f", player.getZ()))
+                .append(" | ").append(message)
+                .toString();
     }
 
     private void appendInventorySummary(StringBuilder sb, Player player) {

@@ -144,6 +144,7 @@ public final class PlayerMoveLog extends JavaPlugin implements CommandExecutor, 
         getLogger().info("  Excel BOM: " + (getConfig().getBoolean("excel-bom", false) ? "开启" : "关闭"));
         getLogger().info("  事件记录: " + (eventLogEnabled ? "开启" : "关闭"));
         getLogger().info("  背包记录: " + (getConfig().getBoolean("log-inventory", false) ? "开启" : "关闭"));
+        getLogger().info("  聊天记录: " + (getConfig().getBoolean("chat-logging.enabled", false) ? "开启" : "关闭"));
         getLogger().info("  记录状态: " + (getConfig().getBoolean("enabled", true) ? "开启" : "暂停"));
         getLogger().info("  输出目录: " + moveLogDir.getAbsolutePath());
     }
@@ -192,12 +193,29 @@ public final class PlayerMoveLog extends JavaPlugin implements CommandExecutor, 
         boolean eventLogEnabled = getConfig().getBoolean("event-logging.enabled", true);
         boolean logInventory = getConfig().getBoolean("log-inventory", false);
 
+        // 聊天日志
+        boolean chatLogEnabled = getConfig().getBoolean("chat-logging.enabled", false);
+        File chatLogDir = null;
+        int chatRotationHours = rotationHours;
+        if (chatLogEnabled) {
+            String chatDirName = getConfig().getString("chat-logging.output-dir", "chatlog");
+            chatLogDir = new File(getServer().getWorldContainer(), chatDirName);
+            if (!chatLogDir.exists() && !chatLogDir.mkdirs()) {
+                getLogger().warning("无法创建 chatlog 目录: " + chatLogDir.getAbsolutePath() + "，聊天记录已禁用。");
+                chatLogDir = null;
+            }
+            chatRotationHours = getConfig().getInt("chat-logging.rotation-hours", rotationHours);
+            if (chatRotationHours < 1 || chatRotationHours > 24 || 24 % chatRotationHours != 0) {
+                chatRotationHours = rotationHours;
+            }
+        }
+
         return new MoveRecorder(
                 this, moveLogDir, tpsThreshold, bufferSize, batchThreshold, batchSize,
                 rotationHours, timezone, dateFormat, timeFormat, enabled,
                 logRetentionDays, excelBom, emptyItemText, exemptPerm,
                 worldWhitelist, worldBlacklist, excludedPlayers, includedPlayers,
-                maxFailures, eventLogEnabled, logInventory
+                maxFailures, eventLogEnabled, logInventory, chatLogDir, chatRotationHours
         );
     }
 
