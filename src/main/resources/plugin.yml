@@ -1,5 +1,5 @@
 name: PlayerMoveLog
-version: 2.1.0
+version: 2.2.0
 main: com.proma.movelog.PlayerMoveLog
 api-version: "1.21"
 description: 玩家移动轨迹记录工具 — 定时+事件驱动，过滤系统，查询命令，TPS保护

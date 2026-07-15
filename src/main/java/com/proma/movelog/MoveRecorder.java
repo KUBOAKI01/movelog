@@ -84,6 +84,8 @@ public class MoveRecorder extends BukkitRunnable {
     private final int maxConsecutiveFailures;
     private final boolean eventLogEnabled;
     private final boolean logInventory;
+    private final File chatLogDir;     // null = chat logging disabled
+    private final int chatRotationHours;
 
     /** 坐标格式化器（DecimalFormat 非线程安全，由 AtomicBoolean running 保证单线程调用） */
     private final DecimalFormat coordFormat =
@@ -115,6 +117,13 @@ public class MoveRecorder extends BukkitRunnable {
     /** 主线程推送的事件日志行队列（无锁线程安全） */
     private final ConcurrentLinkedQueue<String> eventQueue = new ConcurrentLinkedQueue<>();
 
+    /** 聊天消息队列 */
+    private final ConcurrentLinkedQueue<String> chatQueue = new ConcurrentLinkedQueue<>();
+
+    /** 聊天日志的缓冲写入器 */
+    private final Map<String, BufferedWriter> chatWriterMap = new HashMap<>();
+    private final ReentrantLock chatWriterLock = new ReentrantLock();
+
     /** 累计记录条数 */
     private final AtomicLong totalRecords = new AtomicLong(0);
 
@@ -133,7 +142,8 @@ public class MoveRecorder extends BukkitRunnable {
                         String emptyItemText, String exemptPermission,
                         List<String> worldWhitelistRaw, List<String> worldBlacklistRaw,
                         List<String> excludedPlayersRaw, List<String> includedPlayersRaw,
-                        int maxConsecutiveFailures, boolean eventLogEnabled, boolean logInventory) {
+                        int maxConsecutiveFailures, boolean eventLogEnabled, boolean logInventory,
+                        File chatLogDir, int chatRotationHours) {
         // ── 参数校验 ──
         if (bufferSize < 1) {
             throw new IllegalArgumentException("buffer-size 必须 >= 1，当前值: " + bufferSize);
@@ -175,6 +185,8 @@ public class MoveRecorder extends BukkitRunnable {
         this.maxConsecutiveFailures = Math.max(1, maxConsecutiveFailures);
         this.eventLogEnabled = eventLogEnabled;
         this.logInventory = logInventory;
+        this.chatLogDir = chatLogDir;
+        this.chatRotationHours = chatRotationHours;
 
         this.zoneId = ZoneId.of(timezone);
         this.dateFormatter = DateTimeFormatter.ofPattern(dateFormat).withZone(zoneId);
@@ -240,6 +252,16 @@ public class MoveRecorder extends BukkitRunnable {
                 lines.add(eventLine);
             }
 
+            // ── 排出聊天队列 ──
+            List<String> chatLines = null;
+            if (chatLogDir != null) {
+                chatLines = new ArrayList<>();
+                String chatLine;
+                while ((chatLine = chatQueue.poll()) != null) {
+                    chatLines.add(chatLine);
+                }
+            }
+
             // ── 格式化玩家数据 ──
             if (!players.isEmpty()) {
                 for (Player player : players) {
@@ -274,6 +296,20 @@ public class MoveRecorder extends BukkitRunnable {
             if (written > 0) {
                 totalRecords.addAndGet(written);
                 lastSuccessTime.set(System.currentTimeMillis());
+            }
+
+            // ── 写入聊天日志 ──
+            if (chatLines != null && !chatLines.isEmpty()) {
+                String chatBlockKey = computeChatBlockKey(now);
+                for (String cl : chatLines) {
+                    try {
+                        appendToChatFile(chatBlockKey, cl);
+                    } catch (Exception e) {
+                        plugin.getLogger().log(Level.FINE,
+                                "写入聊天日志失败: " + e.getMessage());
+                    }
+                }
+                cleanupStaleChatWriters(chatBlockKey);
             }
 
             // ── 滚动清理：关闭已过期时间块的旧文件句柄 ──
@@ -335,6 +371,15 @@ public class MoveRecorder extends BukkitRunnable {
         if (!eventLogEnabled) return;
         if (shutdown) return;
         eventQueue.add(formattedLine);
+    }
+
+    /**
+     * 从主线程安全推送聊天日志行。
+     */
+    public void recordChat(String formattedLine) {
+        if (chatLogDir == null) return;
+        if (shutdown) return;
+        chatQueue.add(formattedLine);
     }
 
     // ─── 日志行格式化 ───────────────────────────────────────────
@@ -595,6 +640,83 @@ public class MoveRecorder extends BukkitRunnable {
         }
     }
 
+    // ─── 聊天日志文件管理 ────────────────────────────────────────
+
+    private String computeChatBlockKey(ZonedDateTime now) {
+        String dateStr = dateFormatter.format(now);
+        int blockHour = (now.getHour() / chatRotationHours) * chatRotationHours;
+        return dateStr + "-" + PADDED_HOURS[blockHour];
+    }
+
+    private void appendToChatFile(String blockKey, String line) {
+        BufferedWriter writer = null;
+        try {
+            writer = getOrCreateChatWriter(blockKey);
+            if (writer == null) return;
+            writer.write(line);
+            writer.newLine();
+            writer.flush();
+        } catch (IOException e) {
+            plugin.getLogger().log(Level.WARNING,
+                    "写入聊天日志失败: " + e.getMessage());
+            removeChatWriter(blockKey);
+        }
+    }
+
+    private BufferedWriter getOrCreateChatWriter(String blockKey) throws IOException {
+        chatWriterLock.lock();
+        try {
+            if (shutdown) return null;
+            BufferedWriter writer = chatWriterMap.get(blockKey);
+            if (writer != null) return writer;
+            File f = new File(chatLogDir, blockKey + ".log");
+            writer = new BufferedWriter(new FileWriter(f, StandardCharsets.UTF_8, true), bufferSize);
+            chatWriterMap.put(blockKey, writer);
+            return writer;
+        } finally {
+            chatWriterLock.unlock();
+        }
+    }
+
+    private void removeChatWriter(String blockKey) {
+        chatWriterLock.lock();
+        try {
+            BufferedWriter w = chatWriterMap.remove(blockKey);
+            if (w != null) {
+                try { w.flush(); } catch (IOException ignored) {}
+                try { w.close(); } catch (IOException ignored) {
+                    try { w.close(); } catch (IOException ignored2) {}
+                }
+            }
+        } finally {
+            chatWriterLock.unlock();
+        }
+    }
+
+    private void cleanupStaleChatWriters(String currentBlockKey) {
+        chatWriterLock.lock();
+        try {
+            List<String> stale = new ArrayList<>();
+            for (String key : chatWriterMap.keySet()) {
+                if (!key.equals(currentBlockKey)) stale.add(key);
+            }
+            for (String key : stale) {
+                BufferedWriter w = chatWriterMap.get(key);
+                if (w != null) {
+                    try { w.flush(); } catch (IOException ignored) {}
+                    try { w.close(); } catch (IOException ignored) {
+                        try { w.close(); } catch (IOException ignored2) {}
+                    }
+                }
+                chatWriterMap.remove(key);
+            }
+        } finally {
+            chatWriterLock.unlock();
+        }
+    }
+
+    // ─── 主日志清理 ────────────────────────────────────────────
+
     /**
      * 关闭非当前时间块的文件写入器，释放文件句柄。
      * 先 flush/close 再从 map 移除，防止 close 失败时句柄泄漏。
@@ -701,10 +823,13 @@ public class MoveRecorder extends BukkitRunnable {
             plugin.getLogger().warning("等待记录周期完成超时（10 秒），将强制关闭。");
         }
 
-        // 3. 排出事件队列中的剩余事件（写入当前活动的时间块）
+        // 3. 排出事件队列中的剩余事件
         drainEventQueue();
 
-        // 4. 安全关闭所有 writer
+        // 4. 排出聊天队列
+        drainChatQueue();
+
+        // 5. 安全关闭所有 writer（主日志 + 聊天日志）
         writerLock.lock();
         try {
             for (Map.Entry<String, BufferedWriter> entry : writerMap.entrySet()) {
@@ -713,6 +838,16 @@ public class MoveRecorder extends BukkitRunnable {
             writerMap.clear();
         } finally {
             writerLock.unlock();
+        }
+        chatWriterLock.lock();
+        try {
+            for (Map.Entry<String, BufferedWriter> entry : chatWriterMap.entrySet()) {
+                try { entry.getValue().flush(); } catch (IOException ignored) {}
+                try { entry.getValue().close(); } catch (IOException ignored) {}
+            }
+            chatWriterMap.clear();
+        } finally {
+            chatWriterLock.unlock();
         }
     }
 
@@ -735,6 +870,29 @@ public class MoveRecorder extends BukkitRunnable {
                 plugin.getLogger().log(Level.WARNING,
                         "排出事件队列时发生错误: " + e.getMessage(), e);
             }
+        }
+    }
+
+    /**
+     * 关闭前排出聊天队列。
+     */
+    private void drainChatQueue() {
+        if (chatLogDir == null) return;
+        ZonedDateTime now = ZonedDateTime.now(zoneId);
+        String blockKey = computeChatBlockKey(now);
+        String cl;
+        int count = 0;
+        while ((cl = chatQueue.poll()) != null) {
+            try {
+                appendToChatFile(blockKey, cl);
+                count++;
+            } catch (Exception e) {
+                plugin.getLogger().log(Level.WARNING,
+                        "排出聊天队列时发生错误: " + e.getMessage());
+            }
+        }
+        if (count > 0) {
+            plugin.getLogger().info("已排出 " + count + " 条待写入的聊天记录。");
         }
     }
 

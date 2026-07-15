@@ -89,3 +89,16 @@ filter:
   # 包含的玩家名（非空时只记录这些玩家，优先级最高）
   # 例：included-players: ["Steve", "Alex"]
   included-players: []
+
+# ─── 聊天记录 ─────────────────────────────────────
+
+chat-logging:
+  # 是否启用聊天记录（默认关闭）
+  # 开启后所有玩家发言写入 chatlog/ 目录，与 movelog/ 同级
+  enabled: false
+
+  # 聊天日志输出目录名（位于服务器根目录下）
+  output-dir: chatlog
+
+  # 聊天日志切分间隔（小时），默认跟随主 rotation-hours
+  rotation-hours: 4
