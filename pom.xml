@@ -6,7 +6,7 @@
 
     <groupId>com.proma</groupId>
     <artifactId>PlayerMoveLog</artifactId>
-    <version>2.0.0</version>
+    <version>2.1.0</version>
     <name>PlayerMoveLog</name>
     <description>轻量级玩家移动轨迹定时记录插件 — Paper 1.21.x</description>
 

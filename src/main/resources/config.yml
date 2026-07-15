@@ -48,6 +48,12 @@ excel-bom: false
 # 空手时显示的文本（可改为 "empty"、"none"、"AIR" 等）
 item-empty-text: "空"
 
+# 是否记录背包内容（默认关闭）
+# 开启后日志行末尾追加 INV:item1:count1,item2:count2 ... 统计所有非空槽位
+# 覆盖 36 主背包 + 副手 + 4 护甲，相同物品自动合并计数
+# 15 人在线时日均增加约 15 MB 日志体积
+log-inventory: false
+
 # 连续 I/O 失败多少次后暂停对该文件块的写入（防止磁盘满时死循环）
 max-consecutive-failures: 3
 

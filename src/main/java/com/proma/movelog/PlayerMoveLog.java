@@ -127,7 +127,8 @@ public final class PlayerMoveLog extends JavaPlugin implements CommandExecutor, 
             getServer().getPluginManager().registerEvents(
                     new MoveEventListener(moveRecorder, timezone,
                             getConfig().getString("time-format", "yyyy-MM-dd HH:mm:ss"),
-                            getConfig().getString("item-empty-text", "空")),
+                            getConfig().getString("item-empty-text", "空"),
+                            getConfig().getBoolean("log-inventory", false)),
                     this);
         }
 
@@ -142,6 +143,7 @@ public final class PlayerMoveLog extends JavaPlugin implements CommandExecutor, 
         getLogger().info("  日志保留: " + getConfig().getInt("log-retention-days", 30) + " 天");
         getLogger().info("  Excel BOM: " + (getConfig().getBoolean("excel-bom", false) ? "开启" : "关闭"));
         getLogger().info("  事件记录: " + (eventLogEnabled ? "开启" : "关闭"));
+        getLogger().info("  背包记录: " + (getConfig().getBoolean("log-inventory", false) ? "开启" : "关闭"));
         getLogger().info("  记录状态: " + (getConfig().getBoolean("enabled", true) ? "开启" : "暂停"));
         getLogger().info("  输出目录: " + moveLogDir.getAbsolutePath());
     }
@@ -188,13 +190,14 @@ public final class PlayerMoveLog extends JavaPlugin implements CommandExecutor, 
         List<String> includedPlayers = getConfig().getStringList("filter.included-players");
         int maxFailures = getConfig().getInt("max-consecutive-failures", 3);
         boolean eventLogEnabled = getConfig().getBoolean("event-logging.enabled", true);
+        boolean logInventory = getConfig().getBoolean("log-inventory", false);
 
         return new MoveRecorder(
                 this, moveLogDir, tpsThreshold, bufferSize, batchThreshold, batchSize,
                 rotationHours, timezone, dateFormat, timeFormat, enabled,
                 logRetentionDays, excelBom, emptyItemText, exemptPerm,
                 worldWhitelist, worldBlacklist, excludedPlayers, includedPlayers,
-                maxFailures, eventLogEnabled
+                maxFailures, eventLogEnabled, logInventory
         );
     }
 
@@ -484,7 +487,8 @@ public final class PlayerMoveLog extends JavaPlugin implements CommandExecutor, 
             getServer().getPluginManager().registerEvents(
                     new MoveEventListener(moveRecorder, timezone,
                             getConfig().getString("time-format", "yyyy-MM-dd HH:mm:ss"),
-                            getConfig().getString("item-empty-text", "空")),
+                            getConfig().getString("item-empty-text", "空"),
+                            getConfig().getBoolean("log-inventory", false)),
                     this);
         }
 

@@ -14,6 +14,8 @@ import org.bukkit.inventory.ItemStack;
 import java.time.ZoneId;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
+import java.util.LinkedHashMap;
+import java.util.Map;
 
 /**
  * 事件驱动的玩家轨迹监听器。
@@ -37,13 +39,16 @@ public class MoveEventListener implements Listener {
     private final ZoneId zoneId;
     private final DateTimeFormatter timeFormatter;
     private final String emptyItemText;
+    private final boolean logInventory;
 
     public MoveEventListener(MoveRecorder recorder, String timezone,
-                             String timeFormat, String emptyItemText) {
+                             String timeFormat, String emptyItemText,
+                             boolean logInventory) {
         this.recorder = recorder;
         this.zoneId = ZoneId.of(timezone);
         this.timeFormatter = DateTimeFormatter.ofPattern(timeFormat).withZone(zoneId);
         this.emptyItemText = emptyItemText;
+        this.logInventory = logInventory;
     }
 
     // ─── 事件处理 ───────────────────────────────────────────────
@@ -118,15 +123,52 @@ public class MoveEventListener implements Listener {
             itemStr = mainHand.getType().getKey().toString();
         }
 
-        return new StringBuilder(256)
-                .append(timeStr).append(" | ")
-                .append(player.getName()).append(" | ")
-                .append(player.getWorld().getName()).append(':')
-                .append(String.format(java.util.Locale.US, "%.2f", player.getX())).append(':')
-                .append(String.format(java.util.Locale.US, "%.2f", player.getY())).append(':')
-                .append(String.format(java.util.Locale.US, "%.2f", player.getZ()))
-                .append(" | ").append(itemStr)
-                .append(" | EVENT:").append(eventType)
-                .toString();
+        StringBuilder sb = new StringBuilder(logInventory ? 1024 : 256);
+        sb.append(timeStr).append(" | ")
+          .append(player.getName()).append(" | ")
+          .append(player.getWorld().getName()).append(':')
+          .append(String.format(java.util.Locale.US, "%.2f", player.getX())).append(':')
+          .append(String.format(java.util.Locale.US, "%.2f", player.getY())).append(':')
+          .append(String.format(java.util.Locale.US, "%.2f", player.getZ()))
+          .append(" | ").append(itemStr);
+
+        if (logInventory) {
+            sb.append(" | INV ");
+            appendInventorySummary(sb, player);
+        }
+
+        sb.append(" | EVENT:").append(eventType);
+        return sb.toString();
+    }
+
+    private void appendInventorySummary(StringBuilder sb, Player player) {
+        Map<String, Integer> counts = new LinkedHashMap<>();
+        for (ItemStack item : player.getInventory().getContents()) {
+            if (item != null && !item.getType().isAir()) {
+                counts.merge(item.getType().getKey().toString(), item.getAmount(), Integer::sum);
+            }
+        }
+        ItemStack offHand = player.getInventory().getItemInOffHand();
+        if (offHand != null && !offHand.getType().isAir()) {
+            counts.merge(offHand.getType().getKey().toString(), offHand.getAmount(), Integer::sum);
+        }
+        for (ItemStack armor : player.getInventory().getArmorContents()) {
+            if (armor != null && !armor.getType().isAir()) {
+                counts.merge(armor.getType().getKey().toString(), armor.getAmount(), Integer::sum);
+            }
+        }
+        if (counts.isEmpty()) {
+            sb.append('-');
+            return;
+        }
+        boolean first = true;
+        for (Map.Entry<String, Integer> entry : counts.entrySet()) {
+            if (!first) sb.append(',');
+            sb.append(entry.getKey());
+            if (entry.getValue() > 1) {
+                sb.append(':').append(entry.getValue());
+            }
+            first = false;
+        }
     }
 }
