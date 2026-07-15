@@ -1,0 +1,132 @@
+package com.proma.movelog;
+
+import org.bukkit.entity.Player;
+import org.bukkit.event.EventHandler;
+import org.bukkit.event.EventPriority;
+import org.bukkit.event.Listener;
+import org.bukkit.event.entity.PlayerDeathEvent;
+import org.bukkit.event.player.PlayerChangedWorldEvent;
+import org.bukkit.event.player.PlayerJoinEvent;
+import org.bukkit.event.player.PlayerQuitEvent;
+import org.bukkit.event.player.PlayerTeleportEvent;
+import org.bukkit.inventory.ItemStack;
+
+import java.time.ZoneId;
+import java.time.ZonedDateTime;
+import java.time.format.DateTimeFormatter;
+
+/**
+ * 事件驱动的玩家轨迹监听器。
+ * <p>
+ * 监听玩家加入、退出、死亡、切换世界、传送等关键事件，
+ * 在主线程中格式化事件日志行（纯字符串操作，不涉及 I/O），
+ * 然后通过 {@link MoveRecorder#recordEvent(String)} 推送到异步写入队列。
+ * </p>
+ *
+ * <h3>设计原则</h3>
+ * <ul>
+ *   <li>所有事件处理使用 {@link EventPriority#MONITOR} 优先级，不干扰其他插件。</li>
+ *   <li>{@code ignoreCancelled = true} 跳过已取消的事件。</li>
+ *   <li>不在主线程做任何 I/O 操作。</li>
+ *   <li>NPC/假玩家（{@code getAddress() == null}）自动跳过。</li>
+ * </ul>
+ */
+public class MoveEventListener implements Listener {
+
+    private final MoveRecorder recorder;
+    private final ZoneId zoneId;
+    private final DateTimeFormatter timeFormatter;
+    private final String emptyItemText;
+
+    public MoveEventListener(MoveRecorder recorder, String timezone,
+                             String timeFormat, String emptyItemText) {
+        this.recorder = recorder;
+        this.zoneId = ZoneId.of(timezone);
+        this.timeFormatter = DateTimeFormatter.ofPattern(timeFormat).withZone(zoneId);
+        this.emptyItemText = emptyItemText;
+    }
+
+    // ─── 事件处理 ───────────────────────────────────────────────
+
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    public void onPlayerJoin(PlayerJoinEvent event) {
+        Player player = event.getPlayer();
+        if (!isRealPlayer(player)) return;
+        recorder.recordEvent(formatEvent(player, "JOIN"));
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    public void onPlayerQuit(PlayerQuitEvent event) {
+        Player player = event.getPlayer();
+        if (!isRealPlayer(player)) return;
+        recorder.recordEvent(formatEvent(player, "QUIT"));
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    public void onPlayerDeath(PlayerDeathEvent event) {
+        Player player = event.getEntity();
+        if (!isRealPlayer(player)) return;
+        String deathMsg = event.getDeathMessage();
+        String cause = (deathMsg != null) ? deathMsg.replace(player.getName(), "").trim() : "unknown";
+        recorder.recordEvent(formatEvent(player, "DEATH | " + cause));
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    public void onPlayerChangedWorld(PlayerChangedWorldEvent event) {
+        Player player = event.getPlayer();
+        if (!isRealPlayer(player)) return;
+        String from = event.getFrom().getName();
+        recorder.recordEvent(formatEvent(player, "WORLD_CHANGE | from=" + from));
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    public void onPlayerTeleport(PlayerTeleportEvent event) {
+        Player player = event.getPlayer();
+        if (!isRealPlayer(player)) return;
+        // 只记录跨世界传送（同世界传送太频繁，意义不大且刷屏）
+        if (event.getFrom().getWorld() != null
+                && event.getTo().getWorld() != null
+                && !event.getFrom().getWorld().equals(event.getTo().getWorld())) {
+            return; // 跨世界传送已由 PlayerChangedWorldEvent 处理
+        }
+        // 忽略同世界传送，减少日志噪音
+    }
+
+    // ─── 内部方法 ───────────────────────────────────────────────
+
+    /**
+     * 判断是否为真实玩家（排除 NPC/假玩家）。
+     */
+    private boolean isRealPlayer(Player player) {
+        return player.getAddress() != null;
+    }
+
+    /**
+     * 格式化事件日志行。
+     * <p>
+     * 格式与定时记录兼容，末尾追加事件类型标记：
+     * {@code 时间 | 玩家名 | 世界:X:Y:Z | 主手物品 | EVENT:事件类型}
+     * </p>
+     */
+    private String formatEvent(Player player, String eventType) {
+        String timeStr = timeFormatter.format(ZonedDateTime.now(zoneId));
+        ItemStack mainHand = player.getInventory().getItemInMainHand();
+        String itemStr;
+        if (mainHand == null || mainHand.getType().isAir()) {
+            itemStr = emptyItemText;
+        } else {
+            itemStr = mainHand.getType().getKey().toString();
+        }
+
+        return new StringBuilder(256)
+                .append(timeStr).append(" | ")
+                .append(player.getName()).append(" | ")
+                .append(player.getWorld().getName()).append(':')
+                .append(String.format(java.util.Locale.US, "%.2f", player.getX())).append(':')
+                .append(String.format(java.util.Locale.US, "%.2f", player.getY())).append(':')
+                .append(String.format(java.util.Locale.US, "%.2f", player.getZ()))
+                .append(" | ").append(itemStr)
+                .append(" | EVENT:").append(eventType)
+                .toString();
+    }
+}

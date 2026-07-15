@@ -1,6 +1,6 @@
 # PlayerMoveLog — 玩家移动轨迹定时记录插件
 
-> 轻量级 Paper 1.21.x 插件，每 1 分钟异步记录所有在线玩家的坐标与手持物品，零阻塞主线程。
+> Paper 1.21.x 插件。定时 + 事件驱动记录所有玩家坐标与手持物品，支持玩家/世界过滤、轨迹查询、TPS 保护、日志自动清理，零阻塞主线程。
 
 ---
 
@@ -62,11 +62,15 @@
 | 🛡️ TPS 保护 | TPS 低于阈值（默认 18）自动跳过；NaN/Infinity 配置值自动拦截 |
 | 📦 缓冲批量写入 | 8 KiB BufferedWriter + AtomicBoolean 防重入，>100 玩家分批写入 |
 | 🔄 安全热重载 | 全部配置项支持热重载，validate-then-switch 策略，失败保留旧实例 |
-| 🎮 简单命令 | `/movelog on/off/reload/status`，Tab 补全 |
+| 🎯 事件驱动 | 玩家加入/退出/死亡/跨世界切换时即时记录 |
+| 🔍 轨迹查询 | `/movelog search <玩家>` 分页查询玩家历史轨迹 |
+| 🎛️ 过滤系统 | 权限豁免、世界黑白名单、玩家包含/排除列表 |
+| 🧹 自动清理 | 可配置日志保留天数，自动删除过期文件 |
+| 📊 Excel 兼容 | 可选 UTF-8 BOM，Excel 打开中文不乱码 |
+| 🎮 丰富命令 | `/movelog on/off/reload/status/stats/search/version`，Tab 补全过滤 |
 | 🛑 参数校验 | 非法配置值（0/负数/NaN/非法时区）自动拦截或重置 |
 | 👤 真人过滤 | `getAddress() == null` 跳过 NPC/假玩家 |
-| 🧹 资源保护 | flush 与 close 独立 try-catch 防止 fd 泄漏；路径穿越自动检测回退 |
-| 💨 内存优化 | `Entity.getX/Y/Z()` 替代 `getLocation()` 消除对象分配；`StringBuilder` + `DecimalFormat` 替代 `String.format` |
+| 🛡️ 故障退避 | 连续 I/O 失败暂停写入，防止磁盘满死循环 |
 
 ---
 
@@ -109,10 +113,13 @@
 
 | 命令 | 说明 |
 |------|------|
-| `/movelog status` | 查看当前记录状态、TPS、在线玩家数、输出路径 |
+| `/movelog status` | 查看当前记录状态、TPS、在线玩家数（真人+NPC分开展示）、输出路径、上次记录时间 |
 | `/movelog on` | 开启记录（恢复定时采集） |
 | `/movelog off` | 暂停记录（保留缓冲数据不丢失） |
-| `/movelog reload` | 重新加载配置。采用「先验证后切换」策略：配置有误时中止操作并提示错误，旧记录器不受影响继续运行 |
+| `/movelog reload` | 重新加载配置。采用「先验证后切换」策略：配置有误时中止操作，旧记录器不受影响继续运行 |
+| `/movelog stats` | 查看统计信息：累计记录行数、TPS 跳过次数、日志目录大小 |
+| `/movelog search <玩家> [页码]` | 搜索玩家历史轨迹，按时间倒序分页显示 |
+| `/movelog version` | 显示插件版本和项目信息 |
 
 ---
 
@@ -500,6 +507,36 @@ A: **UTF-8**。无论服务器操作系统是什么，日志文件始终以 UTF-
 ---
 
 ## 更新日志
+
+### v2.0.0（2026-07-15）— 「完美版」
+
+**新增**
+- 🎯 事件驱动记录：玩家加入/退出/死亡/跨世界切换时即时记录（`event-logging.enabled`）
+- 🔍 轨迹查询：`/movelog search <玩家> [页码]` 分页查询历史轨迹
+- 🎛️ 过滤系统：权限豁免（`filter.exempt-permission`）、世界黑白名单、玩家包含/排除列表
+- 🧹 日志自动清理：`log-retention-days` 配置保留天数，每天首次记录时自动清理
+- 📊 Excel 兼容：`excel-bom` 选项，新文件自动写入 UTF-8 BOM
+- 📈 统计命令：`/movelog stats` 显示累计记录数、TPS 跳过次数、目录大小
+- 🏷️ 版本命令：`/movelog version`
+- 🛡️ 故障退避：连续 I/O 失败 N 次暂停写入，防止磁盘满时死循环
+- 🔄 健康检查：`/movelog status` 显示上次成功记录时间、真人/总玩家数
+
+**修复 (P0 致命)**
+- shutdown 竞态：现在等待 run() 完成再关闭 writer，消除关闭时数据丢失
+- applyConfig 僵尸状态：新任务启动失败时回滚到旧记录器
+- 磁盘满死循环：连续失败计数 + 退避策略防止 I/O 风暴
+- output-dir 路径穿越：启动/reload 时验证 output-dir 不含 `..`、`/`、`\`
+- close 失败句柄泄漏：close 失败自动重试一次
+- catch(Exception) → catch(Throwable)：防止 Error 杀死异步线程
+
+**优化 (P1-P2)**
+- Tab 补全：根据已输入内容过滤候选（如输入 `o` 只提示 `on`/`off`）
+- computeBlockKey：用预计算 PADDED_HOURS 数组替代 String.format，零分配
+- StringBuilder 128→256：防止超长玩家名/世界名触发扩容
+- 单玩家格式化失败：WARNING → FINE，避免告警疲劳
+- 文件锁重试：getOrCreateWriter 最多重试 3 次（100ms 间隔）
+- cleanupStaleWriters：先 close 后 remove，防止句柄泄漏
+- `/movelog status`：分开展示真人玩家数和总在线数（含 NPC）
 
 ### v1.0.0（2026-07-14）
 
