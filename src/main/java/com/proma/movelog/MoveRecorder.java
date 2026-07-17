@@ -435,8 +435,8 @@ public class MoveRecorder extends BukkitRunnable {
     private void appendInventorySummary(StringBuilder sb, Player player) {
         Map<String, Integer> counts = new LinkedHashMap<>();
 
-        // 扫描所有槽位并合并计数
-        for (ItemStack item : player.getInventory().getContents()) {
+        // 扫描 36 个主背包槽位（不含护甲/副手，单独处理）
+        for (ItemStack item : player.getInventory().getStorageContents()) {
             if (item != null && !item.getType().isAir()) {
                 counts.merge(item.getType().getKey().toString(), item.getAmount(), Integer::sum);
             }
@@ -629,7 +629,7 @@ public class MoveRecorder extends BukkitRunnable {
             if (excelBom && isNewFile) {
                 synchronized (bomWrittenFiles) {
                     if (!bomWrittenFiles.contains(blockKey)) {
-                        writer.write('﻿');
+                        writer.write('﻿'); // UTF-8 BOM
                         bomWrittenFiles.add(blockKey);
                     }
                 }
@@ -929,13 +929,13 @@ public class MoveRecorder extends BukkitRunnable {
                 writer.newLine();
             }
             try { writer.flush(); } catch (IOException ignored) {}
+            plugin.getLogger().info("已排出 " + batch.size() + " 条待写入事件。");
         } catch (IOException e) {
             plugin.getLogger().log(Level.WARNING,
-                    "排出事件队列时发生错误: " + e.getMessage(), e);
+                    "排出事件队列时发生错误（共 " + batch.size() + " 条可能丢失）: " + e.getMessage(), e);
         } finally {
             writerLock.unlock();
         }
-        plugin.getLogger().info("已排出 " + batch.size() + " 条待写入事件。");
     }
 
     /**

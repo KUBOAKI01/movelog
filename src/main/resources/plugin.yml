@@ -1,5 +1,5 @@
 name: PlayerMoveLog
-version: 2.2.0
+version: 2.2.1
 main: com.proma.movelog.PlayerMoveLog
 api-version: "1.21"
 description: 玩家移动轨迹记录工具 — 定时+事件驱动，过滤系统，查询命令，TPS保护
@@ -9,7 +9,7 @@ website: https://github.com/KUBOAKI01/movelog
 commands:
   movelog:
     description: 控制玩家移动轨迹记录插件
-    usage: /movelog <on|off|reload|status>
+    usage: /movelog <on|off|reload|status|stats|search|version>
     permission: movelog.admin
     aliases: [mlog]
 
